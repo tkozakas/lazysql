@@ -1,13 +1,17 @@
 package drivers
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 
-	"github.com/xo/dburl"
+	gomysql "github.com/go-sql-driver/mysql"
 
 	"github.com/jorgerojas26/lazysql/models"
 )
@@ -24,7 +28,12 @@ func (db *MySQL) TestConnection(urlstr string) (err error) {
 func (db *MySQL) Connect(urlstr string) (err error) {
 	db.SetProvider(DriverMySQL)
 
-	db.Connection, err = dburl.Open(urlstr)
+	dsn, err := mysqlDSNFromURL(urlstr)
+	if err != nil {
+		return err
+	}
+
+	db.Connection, err = sql.Open("mysql", dsn)
 	if err != nil {
 		return err
 	}
@@ -35,6 +44,100 @@ func (db *MySQL) Connect(urlstr string) (err error) {
 	}
 
 	return nil
+}
+
+// mysqlDSNFromURL parses a mysql:// URL and builds a go-sql-driver/mysql DSN.
+// This handles database names containing '@' (e.g. Vitess 'keyspace@rdonly')
+// which dburl.Open() cannot parse correctly.
+func mysqlDSNFromURL(urlstr string) (string, error) {
+	u, err := url.Parse(urlstr)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse URL: %w", err)
+	}
+
+	cfg := gomysql.NewConfig()
+	cfg.User = u.User.Username()
+	cfg.Passwd, _ = u.User.Password()
+	cfg.Net = "tcp"
+	cfg.Addr = u.Host
+	if u.Port() == "" {
+		cfg.Addr = u.Hostname() + ":3306"
+	}
+
+	// The database name is the URL path without the leading '/'.
+	// url.Parse correctly preserves '@' in the path component.
+	dbName := strings.TrimPrefix(u.Path, "/")
+	if decoded, err := url.PathUnescape(dbName); err == nil {
+		dbName = decoded
+	}
+	cfg.DBName = dbName
+
+	cfg.Params = make(map[string]string)
+	for key, values := range u.Query() {
+		if len(values) > 0 {
+			cfg.Params[key] = values[0]
+		}
+	}
+
+	// Handle TLS configuration from query parameters
+	if tlsMode, ok := cfg.Params["tls"]; ok {
+		delete(cfg.Params, "tls")
+		switch tlsMode {
+		case "skip-verify":
+			cfg.TLSConfig = "skip-verify"
+		case "true":
+			cfg.TLSConfig = "true"
+		case "custom":
+			// Look for cert/key/ca in query params or use defaults
+			certFile := cfg.Params["tls-cert"]
+			keyFile := cfg.Params["tls-key"]
+			caFile := cfg.Params["tls-ca"]
+			delete(cfg.Params, "tls-cert")
+			delete(cfg.Params, "tls-key")
+			delete(cfg.Params, "tls-ca")
+
+			if certFile != "" && keyFile != "" {
+				tlsConfig, err := buildTLSConfig(certFile, keyFile, caFile)
+				if err != nil {
+					return "", fmt.Errorf("failed to build TLS config: %w", err)
+				}
+				tlsConfigName := "custom"
+				gomysql.DeregisterTLSConfig(tlsConfigName)
+				if err := gomysql.RegisterTLSConfig(tlsConfigName, tlsConfig); err != nil {
+					return "", fmt.Errorf("failed to register TLS config: %w", err)
+				}
+				cfg.TLSConfig = tlsConfigName
+			} else {
+				cfg.TLSConfig = "skip-verify"
+			}
+		}
+	}
+
+	return cfg.FormatDSN(), nil
+}
+
+func buildTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load client cert/key: %w", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		InsecureSkipVerify: true,
+	}
+
+	if caFile != "" {
+		caCert, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read CA cert: %w", err)
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+		tlsConfig.RootCAs = caCertPool
+	}
+
+	return tlsConfig, nil
 }
 
 func (db *MySQL) GetDatabases() ([]string, error) {
